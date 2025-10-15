@@ -1,0 +1,29 @@
+[project]
+name = "stacknash"
+version = "0.1.0"
+description = "A unified Nash and Stackelberg MARL solver built on PyTorch and PettingZoo."
+authors = [
+  { name = "Andrew Lee", email = "andrew@example.com" }
+]
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+
+dependencies = [
+  "torch>=2.0",
+  "numpy",
+  "gymnasium>=0.29",
+  "pettingzoo>=1.24",
+  "tensorboard",
+  "pyyaml"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["marl*"]
+
+[tool.black]
+line-length = 88
+
+[tool.ruff]
+line-length = 88
