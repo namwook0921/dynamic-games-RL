@@ -1,7 +1,9 @@
 import torch, copy
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
-from .ppo_base import PPONashAgent, ActorCriticPPO
+from marl.agents.ppo_base import PPONashAgent
+from marl.nets import ActorCriticPPO
+
 
 
 class PPOStackelbergAgent(PPONashAgent):
