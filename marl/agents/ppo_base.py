@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
+from marl.nets import ActorCriticPPO
 
 
 # ============== Utility dataclasses ==============
@@ -26,29 +27,6 @@ class TrainingArgs:
     is_GAE: bool = True
     log_dir: str = "runs/ppo_nash_pz"
     save_path: str = "out/ppo_nash_history"
-
-# =================================================
-# Basic Actor–Critic network
-# =================================================
-class ActorCriticPPO(nn.Module):
-    def __init__(self, obs_dim: int, n_actions: int):
-        super().__init__()
-        self.actor = nn.Sequential(
-            nn.Linear(obs_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, n_actions),
-            nn.Softmax(dim=-1),
-        )
-        self.critic = nn.Sequential(
-            nn.Linear(obs_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 1),
-        )
-
-    def forward(self, x: torch.Tensor):
-        if x.ndim == 1:
-            x = x.unsqueeze(0)
-        return self.actor(x), self.critic(x)
 
 
 # =================================================
