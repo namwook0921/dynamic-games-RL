@@ -237,7 +237,7 @@ class NashPPO:
                 for ag in self.agent_order:
                     self.writer.add_scalar(f"{ag}/episode_return", ep_ret[ag], steps)
                 ep_ret = {a:0.0 for a in self.agent_order}
-                obs,_=self.env.reset(seed=A.seed)
+                obs,_=self.env.reset()
 
             if steps%A.num_steps==0:
                 aL,cL,eL=self.update(steps)
