@@ -24,6 +24,7 @@ class TrainingArgs:
     entropy_coef: float = 0.01
     value_coef: float = 0.5
     seed: int = 42
+    log_steps: int = 5000
     is_GAE: bool = True
     log_dir: str = "runs/ppo_nash_pz"
     save_path: str = "out/ppo_nash_history"
@@ -245,7 +246,7 @@ class PPONashAgent:
                 self.history["loss_history"].append(
                     {"step":int(steps),"actor":float(aL),"critic":float(cL),"entropy":float(eL)}
                 )
-            if steps%500==0 and episode_rewards:
+            if steps%log_steps==0 and episode_rewards:
                 print(f"[{steps}] last returns {episode_rewards[-1]} | elapsed {datetime.now().replace(microsecond=0)-start}")
 
         self.timing["total_train_time"]=time.perf_counter()-train_t0
