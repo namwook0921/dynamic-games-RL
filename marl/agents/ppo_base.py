@@ -49,9 +49,9 @@ class DictRolloutBuffer:
 
 
 # =================================================
-# Main PPO Nash Agent
+# Main Nash PPO solver
 # =================================================
-class PPONashAgent:
+class NashPPO:
     def __init__(self, env, args: TrainingArgs):
         self.args = args
         self.env = env
