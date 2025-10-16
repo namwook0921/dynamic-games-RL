@@ -1,12 +1,12 @@
 import torch, copy
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
-from marl.agents.ppo_base import PPONashAgent
+from marl.agents.ppo_base import NashPPO
 from marl.nets import ActorCriticPPO
 
 
 
-class PPOStackelbergAgent(PPONashAgent):
+class StackelbergPPO(NashPPO):
     """
     Hierarchical Stackelberg PPO agent for PettingZoo Parallel envs.
     Leader–follower order follows self.agent_order.
