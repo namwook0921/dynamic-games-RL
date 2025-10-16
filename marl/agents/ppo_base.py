@@ -246,7 +246,7 @@ class PPONashAgent:
                 self.history["loss_history"].append(
                     {"step":int(steps),"actor":float(aL),"critic":float(cL),"entropy":float(eL)}
                 )
-            if steps%log_steps==0 and episode_rewards:
+            if steps%A.log_steps==0 and episode_rewards:
                 print(f"[{steps}] last returns {episode_rewards[-1]} | elapsed {datetime.now().replace(microsecond=0)-start}")
 
         self.timing["total_train_time"]=time.perf_counter()-train_t0
