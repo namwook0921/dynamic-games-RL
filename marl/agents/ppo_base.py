@@ -107,27 +107,27 @@ class NashPPO:
     def _compute_advantages(self, rewards, values, next_value, dones_mask):
         T = rewards.shape[0]
         returns = torch.zeros_like(rewards)
-        R = torch.zeros(1, device=rewards.device)
+        R = next_value.detach() * 0.0  # or torch.zeros(1, device=rewards.device)
         for t in reversed(range(T)):
             R = rewards[t] + self.args.gamma * R * (1 - dones_mask[t])
             returns[t] = R
-        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
         advantages = returns - values.squeeze(-1)
         return returns, advantages
+
 
     def _compute_GAE(self, rewards, values, next_value, dones_mask):
         T = rewards.shape[0]
         advantages = torch.zeros_like(rewards)
         gae = torch.zeros(1, device=rewards.device)
-        next_value = next_value.view(1, 1)
+        next_value = next_value.view(1, 1).detach()
         vals = torch.cat([values, next_value], dim=0)
         for t in reversed(range(T)):
-            delta = rewards[t] + self.args.gamma * vals[t+1]*(1-dones_mask[t]) - vals[t]
-            gae = delta + self.args.gamma*self.args.lambda_GAE*(1-dones_mask[t])*gae
+            delta = rewards[t] + self.args.gamma * vals[t+1] * (1 - dones_mask[t]) - vals[t]
+            gae = delta + self.args.gamma * self.args.lambda_GAE * (1 - dones_mask[t]) * gae
             advantages[t] = gae
-        advantages = (advantages - advantages.mean())/(advantages.std()+1e-8)
         returns = advantages + vals[:-1].squeeze(-1)
         return returns, advantages
+
 
     # ------------------------------------------------
     def update(self, global_step):
@@ -167,6 +167,7 @@ class NashPPO:
                 lp_old = torch.stack(self.buffer.logprobs[agent]).to(self.device)
                 ret = returns_per_agent[agent].to(self.device)
                 adv = adv_per_agent[agent].to(self.device)
+                adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
                 probs, values = self.policy_nets[i](s)
                 dist = torch.distributions.Categorical(probs)
