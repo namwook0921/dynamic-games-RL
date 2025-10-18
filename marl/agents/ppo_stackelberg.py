@@ -79,100 +79,81 @@ class StackelbergPPO(NashPPO):
         return acts, logps, vals
 
     def update(self, global_step):
-        dones = torch.tensor(self.buffer.dones, dtype=torch.float32, device=self.device)
-        actor_loss, critic_loss, entropy = [], [], []
-        returns, advs = {}, {}
+        import time
+        t_up0 = time.perf_counter()
 
-        for ag in self.flat_order:
-            i = self._index_of_agent[ag]
-            s = torch.stack(self.buffer.states[ag]).to(self.device)
-            a = torch.stack(self.buffer.actions[ag]).to(self.device)
-            r = torch.stack(self.buffer.rewards[ag]).to(self.device)
-            ns = torch.stack(self.buffer.next_states[ag]).to(self.device)
-            v = torch.stack(self.buffer.values[ag]).to(self.device)
+        dones_mask = torch.tensor(self.buffer.dones, dtype=torch.float32, device=self.device)
+        actor_loss_list, critic_loss_list, entropy_list = [], [], []
+        returns_per_agent, adv_per_agent = {}, {}
+
+        t_fwd0 = time.perf_counter()
+        for i, agent in enumerate(self.agent_order):
+            old_states = torch.stack(self.buffer.states[agent]).to(self.device)
+            old_actions = torch.stack(self.buffer.actions[agent]).to(self.device)
+            old_rewards = torch.stack(self.buffer.rewards[agent]).to(self.device)
+            old_next_states = torch.stack(self.buffer.next_states[agent]).to(self.device)
+            old_log_probs = torch.stack(self.buffer.logprobs[agent]).to(self.device)
+            old_values = torch.stack(self.buffer.values[agent]).to(self.device)
 
             with torch.no_grad():
-                xnv = ns[-1]
+                xnv = old_next_states[-1]
                 prev = {}
-                for ej in self._earlier_by_agent[ag]:
+                for ej in self._earlier_by_agent[agent]:
                     prev[ej] = int(torch.stack(self.buffer.actions[ej])[-1].item())
-                xnv = self._stackelberg_input_from_obs_and_prev(xnv, prev, self._earlier_by_agent[ag])
+                xnv = self._stackelberg_input_from_obs_and_prev(xnv, prev, self._earlier_by_agent[agent])
                 nv = self.old_policy_nets[i](xnv)[1].squeeze(-1)
 
             if self.args.is_GAE:
-                rets, ad = self._compute_GAE(r, v.view(-1, 1), nv, dones)
+                rets, advs = self._compute_GAE(old_rewards, old_values.view(-1, 1), nv, dones_mask)
             else:
-                rets, ad = self._compute_advantages(r, v, nv, dones)
-            returns[ag], advs[ag] = rets, ad
+                rets, advs = self._compute_advantages(old_rewards, old_values, nv, dones_mask)
+            returns_per_agent[agent] = rets
+            adv_per_agent[agent] = advs
+        self.timing["ppo_forward_time"] += time.perf_counter() - t_fwd0
 
-    # ---------- override update ----------
-    def update(self, global_step):
-        # identical to base but augments obs with earlier one-hots
-        dones=torch.tensor(self.buffer.dones, dtype=torch.float32, device=self.device)
-        actor_loss, critic_loss, entropy = [],[],[]
-        returns, advs = {}, {}
-        for i,ag in enumerate(self.agent_order):
-            s=torch.stack(self.buffer.states[ag]).to(self.device)
-            a=torch.stack(self.buffer.actions[ag]).to(self.device)
-            r=torch.stack(self.buffer.rewards[ag]).to(self.device)
-            ns=torch.stack(self.buffer.next_states[ag]).to(self.device)
-            v=torch.stack(self.buffer.values[ag]).to(self.device)
-            with torch.no_grad():
-                xnv=ns[-1]; prev={}
-                for j in range(i):
-                    aj=self.agent_order[j]
-                    prev[aj]=int(torch.stack(self.buffer.actions[aj])[-1].item())
-                xnv=self._stackelberg_input(xnv, prev, i)
-                nv=self.old_policy_nets[i](xnv)[1].squeeze(-1)
-            rets,ad=(self._compute_GAE(r,v.view(-1,1),nv,dones)
-                     if self.args.is_GAE else
-                     self._compute_advantages(r,v,nv,dones))
-            returns[ag],advs[ag]=rets,ad
+        # ----- PPO epochs -----
         for _ in range(self.args.num_epochs):
-            for ag in self.flat_order:
-                i = self._index_of_agent[ag]
-                n_steps = len(self.buffer.states[ag])
-                idx = np.arange(n_steps)
-                np.random.shuffle(idx)
+            t_fwd = time.perf_counter()
+            batches = []
+            for i, agent in enumerate(self.agent_order):
+                s = torch.stack(self.buffer.states[agent]).to(self.device)              # [T, obs]
+                a = torch.stack(self.buffer.actions[agent]).to(self.device)            # [T]
+                lp_old = torch.stack(self.buffer.logprobs[agent]).to(self.device)      # [T]
+                ret = returns_per_agent[agent].to(self.device)                         # [T]
+                adv = adv_per_agent[agent].to(self.device)                             # [T]
 
-                for start in range(0, n_steps, self.args.minibatch_size):
-                    end = start + self.args.minibatch_size
-                    mb_idx = idx[start:end]
+                # Augment states with earlier agents' actions at each timestep
+                s_aug = self._augment_states(agent, s)                                 # [T, obs+sum(onehots)]
 
-                    s = torch.stack(self.buffer.states[ag])[mb_idx].to(self.device)
-                    a = torch.stack(self.buffer.actions[ag])[mb_idx].to(self.device)
-                    old_logp = torch.stack(self.buffer.logprobs[ag])[mb_idx].to(self.device)
-                    adv = advs[ag][mb_idx].detach()
-                    ret = returns[ag][mb_idx].detach()
+                probs, values = self.policy_nets[i](s_aug)
+                dist = torch.distributions.Categorical(probs)
+                lp_new = dist.log_prob(a)
+                ratios = torch.exp(lp_new - lp_old.detach())
 
-                    chosen_prev = {}
-                    for ej in self._earlier_by_agent[ag]:
-                        chosen_prev[ej] = int(torch.stack(self.buffer.actions[ej])[-1].item())
-                    x = self._stackelberg_input_from_obs_and_prev(s, chosen_prev, self._earlier_by_agent[ag])
+                s1 = ratios * adv
+                s2 = torch.clamp(ratios, 1 - self.args.epsilon, 1 + self.args.epsilon) * adv
+                actor_loss = -torch.min(s1, s2).mean()
 
-                    probs, values = self.policy_nets[i](x)
-                    dist = torch.distributions.Categorical(probs)
-                    logp = dist.log_prob(a)
-                    ratio = torch.exp(logp - old_logp)
-                    surr1 = ratio * adv
-                    surr2 = torch.clamp(ratio, 1 - self.args.epsilon, 1 + self.args.epsilon) * adv
-                    policy_loss = -torch.min(surr1, surr2).mean()
+                critic_loss = self.critic_loss(ret, values.squeeze(-1))
+                entropy = dist.entropy().mean()
 
-                    value_loss = 0.5 * (ret - values.squeeze(-1)).pow(2).mean()
-                    entropy = dist.entropy().mean()
+                loss = actor_loss + self.args.value_coef * critic_loss - self.args.entropy_coef * entropy
+                batches.append((i, loss, actor_loss, critic_loss, entropy))
+            self.timing["ppo_forward_time"] += time.perf_counter() - t_fwd
 
-                    loss = (policy_loss +
-                            self.args.value_coef * value_loss -
-                            self.args.entropy_coef * entropy)
+            t_bwd = time.perf_counter()
+            for i, loss, al, cl, ent in batches:
+                self.optimizers[i].zero_grad()
+                loss.backward()
+                self.optimizers[i].step()
+                actor_loss_list.append(al.item())
+                critic_loss_list.append(cl.item())
+                entropy_list.append(ent.item())
+            self.timing["ppo_backward_time"] += time.perf_counter() - t_bwd
 
-                    self.optimizers[i].zero_grad()
-                    loss.backward()
-                    self.optimizers[i].step()
-
-                    self.writer.add_scalar(f"{ag}/policy_loss", policy_loss.item(), global_step)
-                    self.writer.add_scalar(f"{ag}/value_loss", value_loss.item(), global_step)
-                    self.writer.add_scalar(f"{ag}/entropy", entropy.item(), global_step)
-                    
         for i in range(len(self.policy_nets)):
             self.old_policy_nets[i].load_state_dict(self.policy_nets[i].state_dict())
+
+        self.timing["ppo_update_time"] += time.perf_counter() - t_up0
+        return np.mean(actor_loss_list), np.mean(critic_loss_list), np.mean(entropy_list)
            
