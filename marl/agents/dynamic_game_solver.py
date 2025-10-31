@@ -15,8 +15,8 @@ class TrainingArgs:
     epsilon: float = 0.2
     gamma: float = 0.99
     lambda_GAE: float = 0.95
-    pi_lr: float = 1e-4
-    vf_lr: float = 3e-4
+    lr: float = 3e-4
+    grad_clip: float = 0.5
     num_steps: int = 128
     num_epochs: int = 4
     minibatch_size: int = 64
@@ -91,6 +91,7 @@ class DynamicGameSolver:
 
         # ----- build policy nets with hierarchy-aware input dims -----
         self.policy_nets = []
+
         for ag in self.agent_order:
             obs_shape = self.env.observation_space(ag).shape
             obs_dim = int(np.prod(obs_shape))
@@ -107,11 +108,14 @@ class DynamicGameSolver:
             self.policy_nets.append(ActorCriticPPO(in_dim, n_actions).to(self.device))
             print(f"[build] {ag}: obs_dim={obs_dim}, extra={extra}, in_dim={obs_dim+extra}, nA={n_actions}")
 
-        self.old_policy_nets = [copy.deepcopy(net) for net in self.policy_nets]
-        self.actor_opts, self.critic_opts = [], []
-        self.trunks, self.actor_heads, self.critic_heads = [], [], []
+        self.trunks = []
+        self.actor_heads = []
+        self.critic_heads = []
+        self.optimizers = []
+
         for net in self.policy_nets:
-            trunk = getattr(net, "net")            # shared trunk (your ActorCriticPPO has .net)
+            # grab module parts
+            trunk = getattr(net, "net") 
             actor_head = getattr(net, "actor_layer")
             critic_head = getattr(net, "critic_layer")
 
@@ -119,16 +123,15 @@ class DynamicGameSolver:
             self.actor_heads.append(actor_head)
             self.critic_heads.append(critic_head)
 
-            # Actor updates: trunk + actor head
-            self.actor_opts.append(torch.optim.Adam(
-                list(trunk.parameters()) + list(actor_head.parameters()),
-                lr=self.args.pi_lr
-            ))
-            # Critic updates: critic head only (freeze trunk during critic step)
-            self.critic_opts.append(torch.optim.Adam(
-                critic_head.parameters(),
-                lr=self.args.vf_lr
-            ))
+            # single optimizer, single lr = self.args.lr
+            params_all = list(trunk.parameters()) \
+                      + list(actor_head.parameters()) \
+                      + list(critic_head.parameters())
+
+            opt = torch.optim.Adam(params_all, lr=self.args.lr)
+            self.optimizers.append(opt)
+
+        self.old_policy_nets = [copy.deepcopy(net) for net in self.policy_nets]
         self.critic_loss = nn.MSELoss()
 
         self.buffer = DictRolloutBuffer(self.agent_order)
@@ -237,6 +240,174 @@ class DynamicGameSolver:
         returns = advantages + vals[:-1].squeeze(-1)
         return returns, advantages
 
+    @torch.no_grad()
+    def _to_device(self, x: np.ndarray) -> torch.Tensor:
+        """
+        Flatten obs -> torch.Tensor on self.device.
+        """
+        t = torch.tensor(np.asarray(x, dtype=np.float32)).flatten()
+        return t.to(self.device)
+
+    @torch.no_grad()
+    def policy_distribution(self, obs_dict: dict) -> dict:
+        """
+        Compute each agent's action probability distribution for the CURRENT obs_dict
+        without doing any learning.
+
+        Uses self.turn_groups to know move order (Nash vs Stackelberg).
+        For each group in turn_groups:
+            - Agents in earlier groups are considered 'leaders'
+            - Agents in later groups observe one-hots of those earlier actions.
+        We always use argmax actions for conditioning when building later agents'
+        inputs, because that's what followers would expect in Stackelberg play.
+
+        Returns:
+            probs_out = {agent_id: probs_np} where probs_np is shape [n_actions]
+        """
+        probs_out = {}
+        chosen_actions_turn = {}  # {agent_id: int_action} for THIS timestep
+
+        # Flatten "all earlier groups" progressively
+        earlier_agents_so_far: list[str] = []
+
+        # We'll need a map from agent_id to its policy_net index
+        # assuming self.agent_order and self.policy_nets are aligned 1:1
+        index_of = {ag: i for i, ag in enumerate(self.agent_order)}
+
+        for grp in self.turn_groups:
+            # grp is a list[str] of agents that act at the same stage
+            for ag in grp:
+                # build model input for this agent
+                obs_vec = self._to_device(obs_dict[ag])
+
+                x = self._stackelberg_input_from_obs_and_prev_actions(
+                    obs_vec=obs_vec,
+                    prev_actions=chosen_actions_turn,
+                    earlier_list=earlier_agents_so_far,
+                )
+
+                # forward pass
+                net_idx = index_of[ag]
+                self.policy_nets[net_idx].eval()
+                probs, _ = self.policy_nets[net_idx](x)
+
+                if probs.dim() > 1:
+                    probs = probs.squeeze(0)
+                probs_np = probs.cpu().numpy()
+
+                probs_out[ag] = probs_np
+
+                # store argmax action for conditioning of later groups
+                greedy_act = int(np.argmax(probs_np))
+                chosen_actions_turn[ag] = greedy_act
+
+            # after this group acts, they become "earlier" for all future groups
+            earlier_agents_so_far.extend(grp)
+
+        return probs_out
+
+    @torch.no_grad()
+    def rollout_episode(self, greedy: bool = True, max_steps: int | None = None):
+        """
+        Run ONE full episode using frozen policies, no gradient, no buffer writes.
+
+        greedy:
+            True  -> choose argmax(action_probs)
+            False -> multinomial sample from action_probs
+        max_steps:
+            upper bound on env steps (defaults to self.args.max_steps)
+
+        Returns:
+            traj = {
+                "states": list[ dict(agent_id -> obs_at_t) ],
+                "actions": list[ dict(agent_id -> int_action_at_t) ],
+                "rewards": list[ dict(agent_id -> reward_at_t) ],
+                "done_step": int,
+                "episode_return": {agent_id: float_total_return}
+            }
+        """
+        if max_steps is None:
+            max_steps = getattr(self.args, "max_steps", 1000)
+
+        # reset env
+        obs, _ = self.env.reset()
+
+        traj_states = []
+        traj_actions = []
+        traj_rewards = []
+        ep_return = {ag: 0.0 for ag in self.agent_order}
+
+        # helper for policy forward (same logic as policy_distribution but returns sampled action)
+        def decide_actions_for_obs(curr_obs: dict) -> dict:
+            chosen_actions_turn = {}
+            earlier_agents_so_far: list[str] = []
+            actions_for_env = {}
+
+            index_of = {ag: i for i, ag in enumerate(self.agent_order)}
+
+            for grp in self.turn_groups:
+                for ag in grp:
+                    obs_vec = self._to_device(curr_obs[ag])
+
+                    x = self._stackelberg_input_from_obs_and_prev_actions(
+                        obs_vec=obs_vec,
+                        prev_actions=chosen_actions_turn,
+                        earlier_list=earlier_agents_so_far,
+                    )
+
+                    net_idx = index_of[ag]
+                    self.policy_nets[net_idx].eval()
+                    probs, _ = self.policy_nets[net_idx](x)
+                    if probs.dim() > 1:
+                        probs = probs.squeeze(0)
+
+                    probs_np = probs.cpu().numpy()
+
+                    if greedy:
+                        act = int(np.argmax(probs_np))
+                    else:
+                        act = int(np.random.choice(len(probs_np), p=probs_np / probs_np.sum()))
+
+                    chosen_actions_turn[ag] = act
+                    actions_for_env[ag] = act
+
+                earlier_agents_so_far.extend(grp)
+
+            return actions_for_env
+
+        # rollout loop
+        for t in range(max_steps):
+            traj_states.append({ag: np.copy(obs[ag]) for ag in self.agent_order})
+
+            step_actions = decide_actions_for_obs(obs)
+            traj_actions.append(step_actions)
+
+            next_obs, rew, terminated, truncated, info = self.env.step(step_actions)
+
+            traj_rewards.append(rew)
+            for ag in self.agent_order:
+                ep_return[ag] += float(rew.get(ag, 0.0))
+
+            done = False
+            if any(terminated.values()) or any(truncated.values()):
+                done = True
+
+            obs = next_obs
+            if done:
+                done_step = t
+                break
+        else:
+            done_step = max_steps - 1  # hit safety cap
+
+        traj = {
+            "states": traj_states,
+            "actions": traj_actions,
+            "rewards": traj_rewards,
+            "done_step": done_step,
+            "episode_return": ep_return,
+        }
+        return traj
+
 
     # ---------- PPO update (minibatch, per-agent) ----------
     def update(self, global_step: int, do_print):
@@ -280,6 +451,9 @@ class DynamicGameSolver:
 
         # ----- PPO epochs with minibatches (Stackelberg-aware state augmentation) -----
         for epoch in range(A.num_epochs):
+            # accumulate metrics across all agents and minibatches in this epoch
+            epoch_actor_losses, epoch_critic_losses, epoch_entropies = [], [], []
+
             for i, agent in enumerate(self.agent_order):
                 old_states      = torch.stack(self.buffer.states[agent]).to(self.device)
                 old_actions     = torch.stack(self.buffer.actions[agent]).to(self.device)
@@ -294,6 +468,8 @@ class DynamicGameSolver:
                 idx = torch.randperm(N, device=self.device)
                 mb  = A.minibatch_size if A.minibatch_size > 0 else N
 
+                agent_policy_losses, agent_value_losses, agent_entropies = [], [], []
+
                 for start in range(0, N, mb):
                     mb_idx       = idx[start:start+mb]
                     mb_states    = states_aug_full[mb_idx]
@@ -302,65 +478,84 @@ class DynamicGameSolver:
                     mb_returns   = target_returns[mb_idx]
                     mb_advs      = advantages[mb_idx]
 
-                    self.critic_opts[i].zero_grad(set_to_none=True)
-                    probs, values = self.policy_nets[i](mb_states)  # forward 1
-                    dist = torch.distributions.Categorical(probs)
-                    mse = self.critic_loss(values.squeeze(-1), mb_returns)
-                    if hasattr(A, "value_var_norm") and A.value_var_norm:
-                        denom = (mb_returns.var(unbiased=False).detach() + 1e-6)
-                        critic_loss = A.value_coef * (mse / denom)
-                    else:
-                        critic_loss = A.value_coef * mse
-                    critic_loss.backward()
-                    self.critic_opts[i].step()
+                    opt = self.optimizers[i]
+                    opt.zero_grad(set_to_none=True)
 
-                    self.actor_opts[i].zero_grad(set_to_none=True)
-                    probs, _ = self.policy_nets[i](mb_states)  # forward 2 (recompute)
+                    probs, values = self.policy_nets[i](mb_states)
                     dist = torch.distributions.Categorical(probs)
+
+                    # policy loss
                     new_log_probs = dist.log_prob(mb_actions)
                     ratios = torch.exp(new_log_probs - mb_log_probs.detach())
                     surr1 = ratios * mb_advs
                     surr2 = torch.clamp(ratios, 1 - A.epsilon, 1 + A.epsilon) * mb_advs
-                    actor_loss = -torch.min(surr1, surr2).mean()
+                    policy_loss = -torch.min(surr1, surr2).mean()
+
+                    # value loss (raw MSE, before weighting)
+                    value_pred = values.squeeze(-1)
+                    vf_loss_unscaled = self.critic_loss(value_pred, mb_returns)
+
+                    # entropy bonus
                     entropy = dist.entropy().mean()
-                    (-actor_loss - A.entropy_coef * entropy).backward()
-                    self.actor_opts[i].step()
 
+                    # total loss with value_coef and entropy_coef
+                    total_loss = policy_loss \
+                              + A.value_coef * vf_loss_unscaled \
+                              - A.entropy_coef * entropy
 
-                    actor_term   = actor_loss
-                    value_term   = A.value_coef * critic_loss
-                    entropy_term = - A.entropy_coef * entropy
-                    dom_ratio    = (value_term.abs() / (actor_term.abs() + 1e-8)).item()
+                    total_loss.backward()
 
-                    self.writer.add_scalar(f"{agent}/actor_term", actor_term.item(), global_step)
-                    self.writer.add_scalar(f"{agent}/value_term", value_term.item(), global_step)
-                    self.writer.add_scalar(f"{agent}/entropy_term", entropy_term.item(), global_step)
-                    self.writer.add_scalar(f"{agent}/dom_ratio_v_over_a", dom_ratio, global_step)
+                    # global grad clip across all params of this net
+                    if getattr(A, "grad_clip", None) is not None:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.policy_nets[i].parameters(),
+                            A.grad_clip
+                        )
 
-                    actor_loss_list.append(actor_loss.item())
-                    critic_loss_list.append(critic_loss.item())
-                    entropy_list.append(entropy.item())
+                    opt.step()
 
-        # sync target/old nets used for bootstrap
+                    # logging (store these, then average later)
+                    agent_policy_losses.append(policy_loss.item())
+                    agent_value_losses.append(vf_loss_unscaled.item())
+                    agent_entropies.append(entropy.item())
+
+                # ===== Log per-agent average per epoch =====
+                mean_actor   = float(np.mean(agent_policy_losses)) if agent_policy_losses else 0.0
+                mean_critic  = float(np.mean(agent_value_losses)) if agent_value_losses else 0.0
+                mean_entropy = float(np.mean(agent_entropies)) if agent_entropies else 0.0
+                dom_ratio    = mean_critic / (abs(mean_actor) + 1e-8)
+
+                self.writer.add_scalar(f"{agent}/actor_term", mean_actor, global_step)
+                self.writer.add_scalar(f"{agent}/value_term", mean_critic, global_step)
+                self.writer.add_scalar(f"{agent}/entropy_term", -A.entropy_coef * mean_entropy, global_step)
+                self.writer.add_scalar(f"{agent}/dom_ratio_v_over_a", dom_ratio, global_step)
+
+                epoch_actor_losses.append(mean_actor)
+                epoch_critic_losses.append(mean_critic)
+                epoch_entropies.append(mean_entropy)
+
+        # ===== Sync target/old nets used for bootstrap =====
         for i in range(len(self.policy_nets)):
             self.old_policy_nets[i].load_state_dict(self.policy_nets[i].state_dict())
 
-        mean_actor   = float(np.mean(actor_loss_list)) if actor_loss_list else 0.0
-        mean_critic  = float(np.mean(critic_loss_list)) if critic_loss_list else 0.0
-        mean_entropy = float(np.mean(entropy_list)) if entropy_list else 0.0
+        # ===== Log overall averages per update =====
+        mean_actor_all   = float(np.mean(epoch_actor_losses)) if epoch_actor_losses else 0.0
+        mean_critic_all  = float(np.mean(epoch_critic_losses)) if epoch_critic_losses else 0.0
+        mean_entropy_all = float(np.mean(epoch_entropies)) if epoch_entropies else 0.0
 
-        self.writer.add_scalar("loss/actor_mean", mean_actor, global_step)
-        self.writer.add_scalar("loss/critic_mean", mean_critic, global_step)
-        self.writer.add_scalar("loss/entropy_mean", mean_entropy, global_step)
+        self.writer.add_scalar("loss/actor_mean", mean_actor_all, global_step)
+        self.writer.add_scalar("loss/critic_mean", mean_critic_all, global_step)
+        self.writer.add_scalar("loss/entropy_mean", mean_entropy_all, global_step)
 
         self.history["loss_history"].append({
             "step": int(global_step),
-            "actor": mean_actor,
-            "critic": mean_critic,
-            "entropy": mean_entropy
+            "actor": mean_actor_all,
+            "critic": mean_critic_all,
+            "entropy": mean_entropy_all
         })
 
-        return mean_actor, mean_critic, mean_entropy
+        return mean_actor_all, mean_critic_all, mean_entropy_all
+
 
 
     # -------- training loop --------
