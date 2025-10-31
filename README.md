@@ -19,7 +19,7 @@ While these methods have contributed immensely to theoretical understanding, the
 ### 1.2 Project Introduction
 **Dynamic Games Solver** introduces a new, practical way to compute equilibria in multi-agent dynamic systems — **through reinforcement learning (RL)**.
 
-Instead of solving high-dimensional optimization problems directly, this solver learns equilibrium policies via **policy gradient optimization**, allowing it to handle **nonlinear, stochastic, and discrete** environments.
+Instead of solving high-dimensional optimization problems directly, this solver learns equilibrium policies via **Proximal Policy Optimization(PPO)**, allowing it to handle **nonlinear, stochastic, and discrete** environments.
 
 It provides a unified framework for:
 - **Dynamic Nash games** – where all agents make simultaneous decisions each step.  
@@ -41,7 +41,6 @@ It removes the computational barriers that previously made dynamic game analysis
 |  **Unified Solver** | Handles both Nash and Stackelberg dynamic games in a single RL framework. |
 |  **PPO-based Optimization** | Finds equilibrium strategies using Proximal Policy Optimization for stability. |
 | **Flexible Decision Hierarchies** | Define any leader–follower order with `action_sequence`, or run simultaneous (Nash) play. |
-| **Automatic Architecture Detection** | CNNs are used for image-based observations, MLPs for vector inputs—no flags needed. |
 |  **PettingZoo Integration** | Works with any valid PettingZoo environment (MPE, Atari, custom). |
 |  **Logging & Analysis** | TensorBoard integration for rewards, losses, and gradient diagnostics. |
 |  **Training History Export** | Saves `.json` and `.npz` logs for easy post-training analysis and reproducibility. |
@@ -147,11 +146,12 @@ This will show plots for actor and critic losses, entropy, gradient norms, and p
 
 - Each agent has an independent actor–critic policy network.
 
-- The network architecture automatically adapts to the observation type:
+- ~~The network architecture automatically adapts to the observation type:~~
 
-  - Convolutional networks (CNNs) for image observations.
+  - ~~Convolutional networks (CNNs) for image observations.~~
 
-  - Fully connected networks (MLPs) for vector observations.
+  - ~~Fully connected networks (MLPs) for vector observations.~~
+  (Not yet implemented)
 
 - In Stackelberg games, follower agents receive additional one-hot encoded representations of the leaders’ actions.
 
@@ -174,21 +174,50 @@ This will show plots for actor and critic losses, entropy, gradient norms, and p
 - Records gradient magnitudes for both the shared trunk and actor/critic heads for diagnostic purposes.
 
 ## 6. Examples
-### 6.1 PettingZoo MPE Environments
 
-You can experiment with multi-agent particle environments such as:
+### 6.1 PettingZoo MPE: `simple_adversary_v3`
 
-```bash
-from pettingzoo.mpe2 import simple_adversary_v3
+Below is a rollout from a trained Stackelberg policy in the `simple_adversary_v3` environment.
+In this setting, `adversary_0` moves first, and then `agent_0` and `agent_1` respond with access
+to the adversary’s chosen action (hierarchical / leader–follower play):
+
+![Stackelberg policy rollout](assets/simple_adversary_stackelberg.gif)
+
+We train directly on the PettingZoo-style parallel API:
+
+```python
+from mpe2 import simple_adversary_v3
+
+env = simple_adversary_v3.parallel_env(
+    N=2,
+    max_cycles=25,
+    continuous_actions=False
+)
+env.reset(seed=42)
 ```
-[Add Colab Demo]
-By changing the action_sequence, you can switch between Nash and Stackelberg formulations.
+
+Stackelberg hierarchy: adversary is the leader,
+both good agents are followers responding in the same tier.
+
+``` args.action_sequence = [["adversary_0"], ["agent_0", "agent_1"]] ```
+
+Nash baseline: everyone acts simultaneously.
+
+```bash args.action_sequence = None```
+
+## 6.2 Training performance
+
+Smoothed episodic returns per agent across training:
+
+The PPO update terms (policy loss, value loss, entropy bonus) stay stable during training:
+
+[Colab demo coming soon]
 
 ## 7. License
 
 MIT License © 2025 Andrew Lee
 
-## 8. Contact and Acknowledgments
+## 8. Contact
 
 Author: Andrew Namwook Lee
 
