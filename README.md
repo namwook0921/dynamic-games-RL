@@ -205,11 +205,16 @@ Nash baseline: everyone acts simultaneously.
 
 ```bash args.action_sequence = None```
 
-## 6.2 Training performance
+### 6.2 Training performance
 
 Smoothed episodic returns per agent across training:
 
+<img src="assets/training_returns.png" width="450"/>
+
 The PPO update terms (policy loss, value loss, entropy bonus) stay stable during training:
+
+<img src="assets/training_losses.png" width="450"/>
+
 
 [Colab demo coming soon]
 
