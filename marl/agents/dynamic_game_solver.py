@@ -6,6 +6,7 @@ import torch, torch.nn as nn, torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from pathlib import Path
 from gymnasium.spaces import Discrete
+from marl.nets import ActorCriticPPO
 
 # ----------------- Compact training args -----------------
 @dataclass
