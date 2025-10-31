@@ -215,8 +215,11 @@ The PPO update terms (policy loss, value loss, entropy bonus) stay stable during
 
 <img src="assets/training_losses.png" width="450"/>
 
+### 6.3 Colab Demo
 
-[Colab demo coming soon]
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1nFRakxg2DUdClEidBSe2JkDXMvEW-6Ah#scrollTo=-DztdsBzgex0)
+
+
 
 ## 7. License
 
