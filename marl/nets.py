@@ -1,59 +1,31 @@
 # marl/nets.py
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.optim as optim
 import torch.nn.functional as F
 
-
 class ActorCriticPPO(nn.Module):
-    """
-    Actor–Critic network for PPO-based multi-agent reinforcement learning.
 
-    Architecture:
-        Shared base feature extractor (first hidden layer)
-        ├── Actor head -> action logits (Softmax)
-        └── Critic head -> scalar state value
-
-    Args:
-        input_dim (int): Dimension of flattened observation.
-        output_dim (int): Number of discrete actions.
-        hidden_dims (tuple[int, int]): Sizes of hidden layers (default: (64, 64))
-    """
-
-    def __init__(self, input_dim: int, output_dim: int, hidden_dims=(64, 64)):
+    def __init__(self, input_dim, output_dim, hidden_dims=(64, 64)):
         super().__init__()
-
-        # Shared base (first hidden layer)
-        self.shared = nn.Sequential(
+        self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dims[0]),
-            nn.ReLU(),
+            nn.ReLU()
         )
-
-        # Actor head
-        self.actor = nn.Sequential(
+        self.actor_layer = nn.Sequential(
             nn.Linear(hidden_dims[0], hidden_dims[1]),
             nn.ReLU(),
-            nn.Linear(hidden_dims[1], output_dim),
+            nn.Linear(hidden_dims[1], output_dim)
         )
-
-        # Critic head
-        self.critic = nn.Sequential(
+        self.critic_layer = nn.Sequential(
             nn.Linear(hidden_dims[0], hidden_dims[1]),
             nn.ReLU(),
-            nn.Linear(hidden_dims[1], 1),
+            nn.Linear(hidden_dims[1], 1)
         )
 
-        # Optional initialization: small weights for stability
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=nn.init.calculate_gain("relu"))
-                nn.init.constant_(m.bias, 0.0)
-
-    def forward(self, x: torch.Tensor):
-        """Forward pass returning (action_probs, value)."""
-        if x.ndim == 1:
-            x = x.unsqueeze(0)
-        features = self.shared(x)
-        logits = self.actor(features)
-        action_probs = F.softmax(logits, dim=-1)
-        value = self.critic(features)
+    def forward(self, x):
+        x = self.net(x)
+        action_probs = F.softmax(self.actor_layer(x), dim=-1)
+        value = self.critic_layer(x)
         return action_probs, value
